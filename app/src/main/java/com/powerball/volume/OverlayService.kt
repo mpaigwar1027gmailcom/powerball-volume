@@ -9,8 +9,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.ColorStateList
+import android.content.res.Configuration
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
@@ -50,14 +54,19 @@ class OverlayService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private val collapseRunnable = Runnable { showBubble() }
 
-    private var bubble: View? = null
+    private var bubble: ArcView? = null
+    private var bubbleLp: WindowManager.LayoutParams? = null
     private var panel: View? = null
-    private var bubbleX = 0
-    private var bubbleY = 300
+
+    // Remembered position of the arc: which side and how far down.
+    private var onRight = true
+    private var arcY = 300
 
     private val overlayType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun screenW() = resources.displayMetrics.widthPixels
+    private fun screenH() = resources.displayMetrics.heightPixels
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -70,6 +79,16 @@ class OverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Screen rotated: re-stick the arc to the edge.
+        val lp = bubbleLp ?: return
+        val v = bubble ?: return
+        lp.x = if (onRight) screenW() - lp.width else 0
+        lp.y = arcY.coerceIn(0, (screenH() - lp.height).coerceAtLeast(0))
+        try { wm.updateViewLayout(v, lp) } catch (_: Exception) {}
+    }
 
     override fun onDestroy() {
         handler.removeCallbacks(collapseRunnable)
@@ -106,32 +125,48 @@ class OverlayService : Service() {
         }
     }
 
-    // ---------------------------------------------------------------- Bubble
+    // ------------------------------------------------------------ Edge arc
+
+    /** A faint half-oval stuck to the left or right screen edge. */
+    private inner class ArcView(ctx: Context) : View(ctx) {
+        var onRightSide = true
+        private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#3D5AFE"); alpha = 100
+        }
+        private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            color = Color.WHITE; alpha = 90
+            strokeWidth = dp(1).toFloat()
+        }
+
+        override fun onDraw(c: Canvas) {
+            val w = width.toFloat()
+            val h = height.toFloat()
+            // Ellipse is centred on the screen edge; only the half on screen is visible.
+            val rect = if (onRightSide) RectF(0f, 0f, 2 * w, h) else RectF(-w, 0f, w, h)
+            val start = if (onRightSide) 90f else -90f
+            c.drawArc(rect, start, 180f, true, fill)
+            c.drawArc(rect, start, 180f, false, line)
+        }
+    }
 
     private fun showBubble() {
         handler.removeCallbacks(collapseRunnable)
         removeView(panel); panel = null
         if (bubble != null) return
 
-        val size = dp(52)
-        val ball = TextView(this).apply {
-            text = "🔊"
-            textSize = 22f
-            gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#CC3D5AFE"))
-                setStroke(dp(2), Color.parseColor("#99FFFFFF"))
-            }
-        }
+        val w = dp(26)
+        val h = dp(84)
+        val arc = ArcView(this).apply { onRightSide = onRight }
         val lp = WindowManager.LayoutParams(
-            size, size, overlayType,
+            w, h, overlayType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = bubbleX; y = bubbleY
+            x = if (onRight) screenW() - w else 0
+            y = arcY.coerceIn(0, (screenH() - h).coerceAtLeast(0))
         }
 
         val slop = ViewConfiguration.get(this).scaledTouchSlop
@@ -139,7 +174,7 @@ class OverlayService : Service() {
         var touchX = 0f; var touchY = 0f
         var moved = false
 
-        ball.setOnTouchListener { v, e ->
+        arc.setOnTouchListener { v, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
                     startX = lp.x; startY = lp.y
@@ -153,21 +188,33 @@ class OverlayService : Service() {
                     if (abs(dx) > slop || abs(dy) > slop) moved = true
                     if (moved) {
                         lp.x = startX + dx.toInt()
-                        lp.y = startY + dy.toInt()
-                        bubbleX = lp.x; bubbleY = lp.y
+                        lp.y = (startY + dy.toInt()).coerceIn(0, (screenH() - h).coerceAtLeast(0))
                         try { wm.updateViewLayout(v, lp) } catch (_: Exception) {}
                     }
                     true
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (!moved) { removeView(bubble); bubble = null; showPanel() }
+                    if (moved) {
+                        // Snap to the closest side.
+                        onRight = (lp.x + w / 2) > screenW() / 2
+                        arcY = lp.y
+                        lp.x = if (onRight) screenW() - w else 0
+                        arc.onRightSide = onRight
+                        arc.invalidate()
+                        try { wm.updateViewLayout(v, lp) } catch (_: Exception) {}
+                    } else {
+                        arcY = lp.y
+                        removeView(bubble); bubble = null; bubbleLp = null
+                        showPanel()
+                    }
                     true
                 }
                 else -> false
             }
         }
-        bubble = ball
-        try { wm.addView(ball, lp) } catch (_: Exception) { bubble = null }
+        bubble = arc
+        bubbleLp = lp
+        try { wm.addView(arc, lp) } catch (_: Exception) { bubble = null; bubbleLp = null }
     }
 
     // ----------------------------------------------------------------- Panel
@@ -204,7 +251,7 @@ class OverlayService : Service() {
                 cornerRadius = dp(22).toFloat()
                 setColor(Color.parseColor("#EE202124"))
             }
-            // Tapping outside collapses back to the ball.
+            // Tapping outside collapses back to the arc.
             setOnTouchListener { _, e ->
                 if (e.action == MotionEvent.ACTION_OUTSIDE) showBubble()
                 false
@@ -212,7 +259,7 @@ class OverlayService : Service() {
         }
 
         val lp = WindowManager.LayoutParams(
-            (resources.displayMetrics.widthPixels * 0.85f).toInt().coerceAtMost(dp(360)),
+            (screenW() * 0.85f).toInt().coerceAtMost(dp(360)),
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -223,6 +270,34 @@ class OverlayService : Service() {
         panel = scroll
         try { wm.addView(scroll, lp) } catch (_: Exception) { panel = null; showBubble(); return }
         scheduleCollapse(4000)
+    }
+
+    /**
+     * Sets a stream volume and makes sure it really changed. Some phones ignore
+     * setStreamVolume, so if the value didn't change we step it with the same
+     * call the hardware volume keys use. Returns the real resulting volume.
+     */
+    private fun applyVolume(stream: Int, target: Int): Int {
+        try {
+            am.setStreamVolume(stream, target, 0)
+        } catch (e: SecurityException) {
+            throw e
+        } catch (_: Exception) {
+        }
+        var actual = am.getStreamVolume(stream)
+        var guard = 0
+        while (actual != target && guard++ < 40) {
+            val dir = if (target > actual) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
+            try {
+                am.adjustStreamVolume(stream, dir, 0)
+            } catch (_: Exception) {
+                break
+            }
+            val now = am.getStreamVolume(stream)
+            if (now == actual) break
+            actual = now
+        }
+        return actual
     }
 
     private fun addRow(parent: LinearLayout, c: Category) {
@@ -246,17 +321,20 @@ class OverlayService : Service() {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
                     if (!fromUser) return
+                    var actual = p
                     try {
-                        am.setStreamVolume(c.stream, p, 0)
+                        actual = applyVolume(c.stream, p)
                     } catch (e: SecurityException) {
                         Toast.makeText(
                             this@OverlayService,
                             "Grant Do Not Disturb access in the app to change ${c.label}",
                             Toast.LENGTH_SHORT
                         ).show()
+                        actual = try { am.getStreamVolume(c.stream) } catch (_: Exception) { p }
                     } catch (_: Exception) {}
-                    val actual = try { am.getStreamVolume(c.stream) } catch (_: Exception) { p }
                     setLabel(actual)
+                    // If the phone refused, show the real value on the slider.
+                    if (actual != p) s.progress = actual
                     scheduleCollapse(4000)
                 }
                 override fun onStartTrackingTouch(s: SeekBar) {
