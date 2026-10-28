@@ -127,26 +127,49 @@ class OverlayService : Service() {
 
     // ------------------------------------------------------------ Edge arc
 
-    /** A faint half-oval stuck to the left or right screen edge. */
+    /**
+     * Idle look: a thin white "(" curve near the screen edge (no fill).
+     * While being dragged: a hollow ring with a faint dark centre.
+     */
     private inner class ArcView(ctx: Context) : View(ctx) {
         var onRightSide = true
-        private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#3D5AFE"); alpha = 100
-        }
+        var ringMode = false
+
         private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
-            color = Color.WHITE; alpha = 90
-            strokeWidth = dp(1).toFloat()
+            strokeCap = Paint.Cap.ROUND
+            color = Color.WHITE
+            alpha = 215
+            strokeWidth = dp(2).toFloat()
+        }
+        private val ringFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.BLACK
+            alpha = 90
         }
 
         override fun onDraw(c: Canvas) {
             val w = width.toFloat()
             val h = height.toFloat()
-            // Ellipse is centred on the screen edge; only the half on screen is visible.
-            val rect = if (onRightSide) RectF(0f, 0f, 2 * w, h) else RectF(-w, 0f, w, h)
-            val start = if (onRightSide) 90f else -90f
-            c.drawArc(rect, start, 180f, true, fill)
-            c.drawArc(rect, start, 180f, false, line)
+            val cy = h / 2f
+            if (ringMode) {
+                val r = dp(13).toFloat()
+                c.drawCircle(w / 2f, cy, r, ringFill)
+                c.drawCircle(w / 2f, cy, r, line)
+                return
+            }
+            // Thin curve: part of a circle whose centre lies just outside the screen edge.
+            val r = dp(22).toFloat()
+            val gap = dp(12).toFloat()          // distance of the curve's tip from the edge
+            if (onRightSide) {
+                val cx = w - gap + r
+                val rect = RectF(cx - r, cy - r, cx + r, cy + r)
+                c.drawArc(rect, 130f, 100f, false, line)
+            } else {
+                val cx = gap - r
+                val rect = RectF(cx - r, cy - r, cx + r, cy + r)
+                c.drawArc(rect, -50f, 100f, false, line)
+            }
         }
     }
 
@@ -155,7 +178,7 @@ class OverlayService : Service() {
         removeView(panel); panel = null
         if (bubble != null) return
 
-        val w = dp(26)
+        val w = dp(32)
         val h = dp(84)
         val arc = ArcView(this).apply { onRightSide = onRight }
         val lp = WindowManager.LayoutParams(
@@ -187,6 +210,7 @@ class OverlayService : Service() {
                     val dy = e.rawY - touchY
                     if (abs(dx) > slop || abs(dy) > slop) moved = true
                     if (moved) {
+                        if (!arc.ringMode) { arc.ringMode = true; arc.invalidate() }
                         lp.x = startX + dx.toInt()
                         lp.y = (startY + dy.toInt()).coerceIn(0, (screenH() - h).coerceAtLeast(0))
                         try { wm.updateViewLayout(v, lp) } catch (_: Exception) {}
@@ -200,6 +224,7 @@ class OverlayService : Service() {
                         arcY = lp.y
                         lp.x = if (onRight) screenW() - w else 0
                         arc.onRightSide = onRight
+                        arc.ringMode = false
                         arc.invalidate()
                         try { wm.updateViewLayout(v, lp) } catch (_: Exception) {}
                     } else {
